@@ -29,8 +29,7 @@ data ChatServer = ChatServer {
   }
 
 makeChatServer :: IO ChatServer
-makeChatServer = do
-  ChatServer <$> newMVar Map.empty
+makeChatServer = ChatServer <$> newMVar Map.empty
 
 addClient :: ChatServer -> ClientId -> (Text -> STM ()) -> IO ()
 addClient (ChatServer clientsVar) clientId sender =
@@ -68,7 +67,7 @@ rTextDropWhile p = Text.reverse . Text.dropWhile p . Text.reverse
 
 client :: ChatServer -> Net.Application (ResourceT IO)
 client chatServer src sink = do
-  clientId <- liftIO $ myThreadId
+  clientId <- liftIO myThreadId
   chan <- liftIO . atomically $ TMChan.newTBMChan 16
   let
     handleMsg msg =
