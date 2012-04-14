@@ -1,19 +1,24 @@
 {-# OPTIONS -Wall -O2 #-}
-import Data.Conduit ( (=$), ($=), ($$) )
-import qualified Data.Conduit.Network as Net
-import qualified Data.Conduit.TMChan as TMChan
-import Data.Conduit.Text (encode, decode, utf8)
-import qualified Data.Conduit.List as L
-import qualified Data.Text as Text
 import Control.Applicative ((<$>))
 import Control.Concurrent (forkIO, ThreadId, myThreadId, killThread)
 import Control.Concurrent.MVar
+import Control.Concurrent.STM (STM, atomically)
+import Control.Monad.IO.Class (MonadIO, liftIO)
+import Control.Monad.Trans.Resource (ResourceT, runResourceT, MonadResource)
+import Data.Conduit ( (=$), ($=), ($$), Source, Sink )
+import Data.Conduit.Text (encode, decode, utf8)
 import Data.Map(Map)
+import Data.Monoid (mappend, mconcat)
 import Data.Text(Text)
 import qualified Control.Exception as E
+import qualified Data.Conduit.Binary as Bin
+import qualified Data.Conduit.List as L
+import qualified Data.Conduit.Network as Net
+import qualified Data.Conduit.TMChan as TMChan
 import qualified Data.Map as Map
-import Control.Concurrent.STM (STM, atomically)
-import Data.Monoid (mappend, mconcat)
+import qualified Data.Text as Text
+import qualified System.IO as IO
+import Data.ByteString (ByteString)
 
 type ClientId = ThreadId
 
@@ -36,8 +41,7 @@ removeClient (ChatServer clientsVar) clientId =
   modifyMVar_ clientsVar $ return . Map.delete clientId
 
 sendMsg :: ChatServer -> Text -> IO ()
-sendMsg (ChatServer clientsVar) text = do
-  putStrLn $ Text.unpack text
+sendMsg (ChatServer clientsVar) text =
   withMVar clientsVar (atomically . mapM_ ($ text) . Map.elems)
 
 
@@ -62,10 +66,10 @@ withForkIO_ act = withForkIO act . const
 rTextDropWhile :: (Char -> Bool) -> Text -> Text
 rTextDropWhile p = Text.reverse . Text.dropWhile p . Text.reverse
 
-app :: ChatServer -> Net.Application IO
-app chatServer src sink = do
-  clientId <- myThreadId
-  chan <- atomically $ TMChan.newTBMChan 16
+client :: ChatServer -> Net.Application (ResourceT IO)
+client chatServer src sink = do
+  clientId <- liftIO $ myThreadId
+  chan <- liftIO . atomically $ TMChan.newTBMChan 16
   let
     handleMsg msg =
       sendMsg chatServer $
@@ -74,11 +78,21 @@ app chatServer src sink = do
       , msg
       ]
     tx = TMChan.sourceTBMChan chan $$ L.map (`mappend` Text.pack "\n") =$ encode utf8 =$ sink
-    rx = src $= decode utf8 $$ L.mapM_ (handleMsg . rTextDropWhile (=='\n'))
-  withClient chatServer clientId (TMChan.writeTBMChan chan) $
-    withForkIO_ tx rx
+    rx = src $= decode utf8 $$ L.mapM_ (liftIO . handleMsg . rTextDropWhile (=='\n'))
+  liftIO .
+    withClient chatServer clientId (TMChan.writeTBMChan chan) $
+      withForkIO_ (runResourceT tx) (runResourceT rx)
+
+runStdHandles
+  :: (MonadResource m)
+  => (Source m ByteString
+      -> Sink ByteString m ()
+      -> a)
+  -> a
+runStdHandles f = f (Bin.sourceHandle IO.stdin) (Bin.sinkHandle IO.stdout)
 
 main :: IO ()
 main = do
   chatServer <- makeChatServer
-  Net.runTCPServer (Net.ServerSettings 12345 Net.HostAny) (app chatServer)
+  withForkIO_ ((runResourceT . runStdHandles) (client chatServer)) .
+    runResourceT $ Net.runTCPServer (Net.ServerSettings 12345 Net.HostAny) (client chatServer)
